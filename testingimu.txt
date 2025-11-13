@@ -11,27 +11,41 @@ import re
 import math
 import board
 import busio
+import sys
+import os
 
 # Adafruit BNO08x (version 1.2.4 structure)
 from adafruit_bno08x.i2c import BNO08X_I2C
 from adafruit_bno08x import BNO_REPORT_ROTATION_VECTOR
 
 
-HOST = "localhost"
+# ----------------------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------------------
+HOST = "0.0.0.0"                     # listen on all interfaces (Linux-friendly)
 PORT = 2003
-UPDATE_RATE_HZ = 1                     # 1-second updates everywhere
-XBEE_PORT = "COM14"                    # <-- change if needed
+UPDATE_RATE_HZ = 1                   # 1-second updates everywhere
+
+# ---------- LINUX USB-UART ----------
+# First USB-UART device (ttyUSB0).  If you have more than one, change the index.
+XBEE_PORT = "/dev/ttyUSB0"
 XBEE_BAUD = 9600
 
-# --------------------------------------------------------------
+# Fallback ports – useful if the device appears under a different name
+FALLBACK_PORTS = [
+    "/dev/ttyUSB1",
+    "/dev/ttyACM0",
+    "/dev/ttyACM1",
+]
+
+# ----------------------------------------------------------------------
 # HIGH PRECISION QUATERNION → EULER
-# --------------------------------------------------------------
+# ----------------------------------------------------------------------
 def quaternion_to_euler(w, x, y, z):
     """Convert quaternion to Euler angles (roll, pitch, yaw) in radians"""
-    # Normalize quaternion safely
     norm = math.sqrt(w*w + x*x + y*y + z*z)
     if norm == 0 or math.isnan(norm):
-        return None  # signal invalid quaternion
+        return None
 
     w /= norm
     x /= norm
@@ -55,31 +69,30 @@ def quaternion_to_euler(w, x, y, z):
 
     return roll, pitch, yaw
 
-# --------------------------------------------------------------
+
+# ----------------------------------------------------------------------
 # GLOBAL STATE (thread-safe)
-# --------------------------------------------------------------
+# ----------------------------------------------------------------------
 class SystemState:
     def __init__(self):
-        # raw IMU (from sensor)
         self.raw_pitch = 0.0
         self.raw_roll  = 0.0
         self.raw_yaw   = 0.0
-        self.heading = 280.0  # Fixed heading for gun_id 1
+        self.heading   = 280.0          # Fixed heading for gun_id 1
 
         # raw GNSS (simulated)
         self.latitude  = 28.6139
         self.longitude = 77.2090
         self.altitude  = 250.0
 
-        # **ZigBee corrections** – updated from serial
+        # ZigBee corrections
         self.correction_x = 0.0
         self.correction_y = 0.0
         self.correction_z = 0.0
 
-        # Gun ID
         self.gun_id = 1
 
-        # Zero reference (SET button) - stores the raw values at SET moment
+        # Zero reference (SET button)
         self.zero_pitch = 0.0
         self.zero_roll  = 0.0
         self.zero_yaw   = 0.0
@@ -94,81 +107,62 @@ ser = None
 # Global BNO085 sensor
 bno = None
 
-# --------------------------------------------------------------
+
+# ----------------------------------------------------------------------
 # REAL IMU (BNO085) READER
-# --------------------------------------------------------------
+# ----------------------------------------------------------------------
 def read_imu_data():
-    """Read real IMU data from BNO085 sensor"""
     global bno
-    
     try:
-        # Init I2C
         i2c = busio.I2C(board.SCL, board.SDA)
-        
-        # Create sensor object
         bno = BNO08X_I2C(i2c)
-        
-        # Enable rotation vector (fused orientation)
         bno.enable_feature(BNO_REPORT_ROTATION_VECTOR)
-        
         print("BNO085 IMU initialized successfully")
     except Exception as e:
         print(f"Failed to initialize BNO085: {e}")
         print("Falling back to simulated IMU data")
-        # Fallback to simulated data
         while True:
             with state.lock:
-                state.raw_pitch  += random.uniform(-0.08, 0.08)
-                state.raw_roll   += random.uniform(-0.08, 0.08)
-                state.raw_yaw    += random.uniform(-0.08, 0.08)
-                # Heading fixed at 280.0 for gun_id 1
+                state.raw_pitch += random.uniform(-0.08, 0.08)
+                state.raw_roll  += random.uniform(-0.08, 0.08)
+                state.raw_yaw   += random.uniform(-0.08, 0.08)
                 state.heading = 280.0
-            time.sleep(0.01)  # 100 Hz
+            time.sleep(0.01)
         return
 
-    # Main loop - read real sensor data
     while True:
         try:
-            q = bno.quaternion  # returns tuple: (w, x, y, z)
-
+            q = bno.quaternion
             if q is None or len(q) != 4:
-                print("Invalid quaternion read")
                 time.sleep(0.01)
                 continue
 
             w, x, y, z = q
-
-            # Convert to Euler
             euler = quaternion_to_euler(w, x, y, z)
             if euler is None:
-                print("Quaternion invalid (norm=0)")
                 time.sleep(0.01)
                 continue
 
             roll, pitch, yaw = euler
-
-            # Convert to degrees (highest precision)
             roll_deg  = math.degrees(roll)
             pitch_deg = math.degrees(pitch)
             yaw_deg   = math.degrees(yaw)
 
-            # Update state with RAW IMU data (before zero reference applied)
             with state.lock:
                 state.raw_roll  = roll_deg
                 state.raw_pitch = pitch_deg
                 state.raw_yaw   = yaw_deg
-                # Heading remains fixed at 280.0 for gun_id 1
                 state.heading = 280.0
 
-            time.sleep(0.01)  # 100 Hz sampling rate
-
+            time.sleep(0.01)          # 100 Hz sampling
         except Exception as e:
             print(f"Error reading IMU: {e}")
             time.sleep(0.1)
 
-# --------------------------------------------------------------
+
+# ----------------------------------------------------------------------
 # SIMULATED GNSS
-# --------------------------------------------------------------
+# ----------------------------------------------------------------------
 def read_gnss_data():
     while True:
         with state.lock:
@@ -177,20 +171,36 @@ def read_gnss_data():
             state.altitude  += random.uniform(-0.08, 0.08)
         time.sleep(1.0)
 
-# --------------------------------------------------------------
-# **ZIGBEE READER & SENDER** – parses "1 1.0 1.0 1.0" (gun_id correction_x correction_y correction_z)
-# --------------------------------------------------------------
-def read_zigbee_corrections():
-    """Open the serial port and update state.correction_* on every line. Also handles sending."""
+
+# ----------------------------------------------------------------------
+# ZIGBEE READER & SENDER (Linux /dev/ttyUSB0)
+# ----------------------------------------------------------------------
+def open_zigbee_port():
+    """Try to open the primary port, fall back to alternatives if needed."""
     global ser
-    try:
-        ser = serial.Serial(XBEE_PORT, XBEE_BAUD, timeout=1)
-        print(f"ZigBee opened on {XBEE_PORT} @ {XBEE_BAUD} baud")
-    except Exception as e:
-        print(f"Failed to open ZigBee port: {e}")
+
+    ports_to_try = [XBEE_PORT] + FALLBACK_PORTS
+    for p in ports_to_try:
+        if not os.path.exists(p):
+            continue
+        try:
+            ser = serial.Serial(p, XBEE_BAUD, timeout=1)
+            print(f"ZigBee opened on {p} @ {XBEE_BAUD} baud")
+            return True
+        except Exception as e:
+            print(f"Could not open {p}: {e}")
+
+    print("ERROR: No ZigBee device found on any candidate port.")
+    return False
+
+
+def read_zigbee_corrections():
+    """Open serial port and handle incoming/outgoing messages."""
+    global ser
+
+    if not open_zigbee_port():
         return
 
-    # Regex: 1 1.0 1.0 1.0
     pattern = re.compile(
         r'(?P<gun_id>\d+) '
         r'(?P<x>[\d\.\-]+) '
@@ -199,11 +209,12 @@ def read_zigbee_corrections():
     )
 
     last_send_time = 0
-    SEND_INTERVAL = 1.0  # Send heading every 1 second
+    SEND_INTERVAL = 1.0
 
     while True:
         current_time = time.time()
-        # Send heading periodically
+
+        # ---- SEND heading every second ----
         if current_time - last_send_time >= SEND_INTERVAL:
             with state.lock:
                 gun_id = state.gun_id
@@ -211,18 +222,19 @@ def read_zigbee_corrections():
             try:
                 msg = f"{gun_id} {heading}\n"
                 ser.write(msg.encode('utf-8'))
-                print(f"📤 Sent to ZigBee: {msg.strip()} (gun_id={gun_id}, heading={heading}°)")
+                print(f"Sent to ZigBee: {msg.strip()} (gun_id={gun_id}, heading={heading}°)")
                 last_send_time = current_time
             except Exception as e:
                 print(f"[ZigBee send error] {e}")
 
+        # ---- READ incoming corrections ----
         try:
             if ser.in_waiting > 0:
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if not line:
                     continue
 
-                print(f"📥 Received ZigBee: {line}")
+                print(f"Received ZigBee: {line}")
 
                 m = pattern.fullmatch(line)
                 if m:
@@ -239,20 +251,21 @@ def read_zigbee_corrections():
                         state.correction_x = x
                         state.correction_y = y
                         state.correction_z = z
-                        state.gun_id = gun_id  # Ensure gun_id is set (already 1)
+                        state.gun_id = gun_id
 
-                    print(f"   → Updated corrections X={x}, Y={y}, Z={z} for gun_id={gun_id}")
+                    print(f"   → Updated corrections X={x}, Y={y}, Z={z}")
                 else:
                     print("   (ignored – does not match pattern)")
 
         except Exception as e:
             print(f"[ZigBee read error] {e}")
 
-        time.sleep(0.05)   # tiny sleep – we still want to be responsive
+        time.sleep(0.05)
 
-# --------------------------------------------------------------
+
+# ----------------------------------------------------------------------
 # WEBSOCKET SERVER
-# --------------------------------------------------------------
+# ----------------------------------------------------------------------
 connected_clients = set()
 
 async def handle_client(ws):
@@ -268,21 +281,12 @@ async def handle_client(ws):
                     cmd = json.loads(msg)
                     if cmd.get('command') == 'SET':
                         with state.lock:
-                            # Store current RAW IMU values as the new zero reference
                             state.zero_pitch = state.raw_pitch
                             state.zero_roll  = state.raw_roll
                             state.zero_yaw   = state.raw_yaw
-                            
-                            # CRITICAL: Reset corrections to zero so displayed values become 0°
-                            state.correction_x = 0.0
-                            state.correction_y = 0.0
-                            state.correction_z = 0.0
-                            
-                        print(f"✅ SET pressed – New zero reference set:")
-                        print(f"   Zero Pitch: {state.zero_pitch:.3f}°")
-                        print(f"   Zero Roll:  {state.zero_roll:.3f}°")
-                        print(f"   Zero Yaw:   {state.zero_yaw:.3f}°")
-                        print(f"   All corrections reset to 0.0")
+                            # Reset corrections so displayed values become 0°
+                            state.correction_x = state.correction_y = state.correction_z = 0.0
+                        print(f"SET pressed – Zero reference updated")
             except websockets.exceptions.ConnectionClosed:
                 pass
 
@@ -291,9 +295,6 @@ async def handle_client(ws):
         # ----- broadcast loop (1 Hz) -----
         while True:
             with state.lock:
-                # Calculate relative IMU values:
-                # displayed_value = (raw_value - zero_reference) + correction
-                # This means after SET (when corrections=0), all displayed values will be 0°
                 rel_pitch = (state.raw_pitch - state.zero_pitch) + state.correction_y
                 rel_roll  = (state.raw_roll  - state.zero_roll)  + state.correction_x
                 rel_yaw   = (state.raw_yaw   - state.zero_yaw)   + state.correction_z
@@ -325,22 +326,23 @@ async def handle_client(ws):
                 }
 
             await ws.send(json.dumps(payload))
-            await asyncio.sleep(1.0)          # 1-second delay
+            await asyncio.sleep(1.0)
 
     except websockets.exceptions.ConnectionClosed:
         print("Client disconnected")
     finally:
         connected_clients.discard(ws)
 
-# --------------------------------------------------------------
-# MAIN
-# --------------------------------------------------------------
-async def main():
-    print("Artillery Pointing System Server")
-    print(f"WebSocket: ws://{HOST}:{PORT}")
-    print(f"Update rate: {UPDATE_RATE_HZ} Hz (1-second delay)")
 
-    # start sensor threads
+# ----------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------
+async def main():
+    print("Artillery Pointing System Server (Linux)")
+    print(f"WebSocket: ws://{HOST}:{PORT}")
+    print(f"Update rate: {UPDATE_RATE_HZ} Hz")
+
+    # Start background threads
     threading.Thread(target=read_imu_data, daemon=True).start()
     threading.Thread(target=read_gnss_data, daemon=True).start()
     threading.Thread(target=read_zigbee_corrections, daemon=True).start()
@@ -348,10 +350,12 @@ async def main():
     async with websockets.serve(handle_client, HOST, PORT):
         await asyncio.Future()   # run forever
 
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nServer stopped")
+    finally:
         if ser and ser.is_open:
             ser.close()
