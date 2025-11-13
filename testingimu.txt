@@ -60,10 +60,10 @@ def quaternion_to_euler(w, x, y, z):
 # --------------------------------------------------------------
 class SystemState:
     def __init__(self):
-        # raw IMU
-        self.pitch = 0.0
-        self.roll  = 0.0
-        self.yaw   = 0.0
+        # raw IMU (from sensor)
+        self.raw_pitch = 0.0
+        self.raw_roll  = 0.0
+        self.raw_yaw   = 0.0
         self.heading = 280.0  # Fixed heading for gun_id 1
 
         # raw GNSS (simulated)
@@ -79,7 +79,7 @@ class SystemState:
         # Gun ID
         self.gun_id = 1
 
-        # Zero reference (SET button)
+        # Zero reference (SET button) - stores the raw values at SET moment
         self.zero_pitch = 0.0
         self.zero_roll  = 0.0
         self.zero_yaw   = 0.0
@@ -118,9 +118,9 @@ def read_imu_data():
         # Fallback to simulated data
         while True:
             with state.lock:
-                state.pitch  += random.uniform(-0.08, 0.08)
-                state.roll   += random.uniform(-0.08, 0.08)
-                state.yaw    += random.uniform(-0.08, 0.08)
+                state.raw_pitch  += random.uniform(-0.08, 0.08)
+                state.raw_roll   += random.uniform(-0.08, 0.08)
+                state.raw_yaw    += random.uniform(-0.08, 0.08)
                 # Heading fixed at 280.0 for gun_id 1
                 state.heading = 280.0
             time.sleep(0.01)  # 100 Hz
@@ -152,11 +152,11 @@ def read_imu_data():
             pitch_deg = math.degrees(pitch)
             yaw_deg   = math.degrees(yaw)
 
-            # Update state with real IMU data
+            # Update state with RAW IMU data (before zero reference applied)
             with state.lock:
-                state.roll  = roll_deg
-                state.pitch = pitch_deg
-                state.yaw   = yaw_deg
+                state.raw_roll  = roll_deg
+                state.raw_pitch = pitch_deg
+                state.raw_yaw   = yaw_deg
                 # Heading remains fixed at 280.0 for gun_id 1
                 state.heading = 280.0
 
@@ -268,15 +268,21 @@ async def handle_client(ws):
                     cmd = json.loads(msg)
                     if cmd.get('command') == 'SET':
                         with state.lock:
-                            # store current raw IMU as zero reference
-                            state.zero_pitch = state.pitch
-                            state.zero_roll  = state.roll
-                            state.zero_yaw   = state.yaw
-                            # **reset corrections** so UI instantly shows 0°
+                            # Store current RAW IMU values as the new zero reference
+                            state.zero_pitch = state.raw_pitch
+                            state.zero_roll  = state.raw_roll
+                            state.zero_yaw   = state.raw_yaw
+                            
+                            # CRITICAL: Reset corrections to zero so displayed values become 0°
                             state.correction_x = 0.0
                             state.correction_y = 0.0
                             state.correction_z = 0.0
-                        print("SET – zero reference + corrections cleared")
+                            
+                        print(f"✅ SET pressed – New zero reference set:")
+                        print(f"   Zero Pitch: {state.zero_pitch:.3f}°")
+                        print(f"   Zero Roll:  {state.zero_roll:.3f}°")
+                        print(f"   Zero Yaw:   {state.zero_yaw:.3f}°")
+                        print(f"   All corrections reset to 0.0")
             except websockets.exceptions.ConnectionClosed:
                 pass
 
@@ -285,14 +291,16 @@ async def handle_client(ws):
         # ----- broadcast loop (1 Hz) -----
         while True:
             with state.lock:
-                # relative IMU = raw – zero + correction
-                rel_pitch = (state.pitch - state.zero_pitch) + state.correction_y
-                rel_roll  = (state.roll  - state.zero_roll)  + state.correction_x
-                rel_yaw   = (state.yaw   - state.zero_yaw)   + state.correction_z
+                # Calculate relative IMU values:
+                # displayed_value = (raw_value - zero_reference) + correction
+                # This means after SET (when corrections=0), all displayed values will be 0°
+                rel_pitch = (state.raw_pitch - state.zero_pitch) + state.correction_y
+                rel_roll  = (state.raw_roll  - state.zero_roll)  + state.correction_x
+                rel_yaw   = (state.raw_yaw   - state.zero_yaw)   + state.correction_z
 
                 payload = {
                     "timestamp": datetime.now(UTC).isoformat() + "Z",
-                    "gun_id": state.gun_id,  # Added gun_id section
+                    "gun_id": state.gun_id,
                     "imu": {
                         "pitch":   round(rel_pitch, 2),
                         "roll":    round(rel_roll, 2),
@@ -309,15 +317,12 @@ async def handle_client(ws):
                         "y": round(state.correction_y, 2),
                         "z": round(state.correction_z, 2)
                     },
-                    "target": {                     # **target = corrections**
+                    "target": {
                         "pitch": round(state.correction_y, 2),
                         "roll":  round(state.correction_x, 2),
                         "yaw":   round(state.correction_z, 2)
                     }
                 }
-
-            # Print the sent data to terminal for visibility
-            print(f"Sending to clients: gun_id={payload['gun_id']}, heading={payload['imu']['heading']}, full payload={json.dumps(payload)}")
 
             await ws.send(json.dumps(payload))
             await asyncio.sleep(1.0)          # 1-second delay
