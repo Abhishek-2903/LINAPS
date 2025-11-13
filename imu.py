@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+import asyncio
+import json
+import websockets
+from datetime import datetime, UTC
+import serial
+import threading
+import time
+import random
+import re
+
+
+HOST = "localhost"
+PORT = 2003
+UPDATE_RATE_HZ = 1                     # 1-second updates everywhere
+XBEE_PORT = "COM14"                    # <-- change if needed
+XBEE_BAUD = 9600
+
+# --------------------------------------------------------------
+# GLOBAL STATE (thread-safe)
+# --------------------------------------------------------------
+class SystemState:
+    def __init__(self):
+        # raw IMU
+        self.pitch = 0.0
+        self.roll  = 0.0
+        self.yaw   = 0.0
+        self.heading = 145.0  # Fixed heading for gun_id 1
+
+        # raw GNSS (simulated)
+        self.latitude  = 28.6139
+        self.longitude = 77.2090
+        self.altitude  = 250.0
+
+        # **ZigBee corrections** – updated from serial
+        self.correction_x = 0.0
+        self.correction_y = 0.0
+        self.correction_z = 0.0
+
+        # Gun ID
+        self.gun_id = 1
+
+        # Zero reference (SET button)
+        self.zero_pitch = 0.0
+        self.zero_roll  = 0.0
+        self.zero_yaw   = 0.0
+
+        self.lock = threading.Lock()
+
+state = SystemState()
+
+# Global ZigBee serial (shared for read/write)
+ser = None
+
+# --------------------------------------------------------------
+# SIMULATED IMU (replace with real I2C/UART later)
+# --------------------------------------------------------------
+def read_imu_data():
+    while True:
+        with state.lock:
+            state.pitch  += random.uniform(-0.08, 0.08)
+            state.roll   += random.uniform(-0.08, 0.08)
+            state.yaw    += random.uniform(-0.08, 0.08)
+            # Heading fixed at 145.0 for gun_id 1 (no random drift)
+            state.heading = 280.0
+        time.sleep(1.0)
+
+# --------------------------------------------------------------
+# SIMULATED GNSS
+# --------------------------------------------------------------
+def read_gnss_data():
+    while True:
+        with state.lock:
+            state.latitude  += random.uniform(-0.000008, 0.000008)
+            state.longitude += random.uniform(-0.000008, 0.000008)
+            state.altitude  += random.uniform(-0.08, 0.08)
+        time.sleep(1.0)
+
+# --------------------------------------------------------------
+# **ZIGBEE READER & SENDER** – parses "1 1.0 1.0 1.0" (gun_id correction_x correction_y correction_z)
+# --------------------------------------------------------------
+def read_zigbee_corrections():
+    """Open the serial port and update state.correction_* on every line. Also handles sending."""
+    global ser
+    try:
+        ser = serial.Serial(XBEE_PORT, XBEE_BAUD, timeout=1)
+        print(f"ZigBee opened on {XBEE_PORT} @ {XBEE_BAUD} baud")
+    except Exception as e:
+        print(f"Failed to open ZigBee port: {e}")
+        return
+
+    # Regex: 1 1.0 1.0 1.0
+    pattern = re.compile(
+        r'(?P<gun_id>\d+) '
+        r'(?P<x>[\d\.\-]+) '
+        r'(?P<y>[\d\.\-]+) '
+        r'(?P<z>[\d\.\-]+)'
+    )
+
+    last_send_time = 0
+    SEND_INTERVAL = 1.0  # Send heading every 1 second
+
+    while True:
+        current_time = time.time()
+        # Send heading periodically
+        if current_time - last_send_time >= SEND_INTERVAL:
+            with state.lock:
+                gun_id = state.gun_id
+                heading = state.heading
+            try:
+                msg = f"{gun_id} {heading}\n"
+                ser.write(msg.encode('utf-8'))
+                print(f"📤 Sent to ZigBee: {msg.strip()} (gun_id={gun_id}, heading={heading}°)")
+                last_send_time = current_time
+            except Exception as e:
+                print(f"[ZigBee send error] {e}")
+
+        try:
+            if ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if not line:
+                    continue
+
+                print(f"📥 Received ZigBee: {line}")
+
+                m = pattern.fullmatch(line)
+                if m:
+                    gun_id = int(m.group('gun_id'))
+                    if gun_id != 1:
+                        print("   (ignored – gun_id is not 1)")
+                        continue
+
+                    x = float(m.group('x'))
+                    y = float(m.group('y'))
+                    z = float(m.group('z'))
+
+                    with state.lock:
+                        state.correction_x = x
+                        state.correction_y = y
+                        state.correction_z = z
+                        state.gun_id = gun_id  # Ensure gun_id is set (already 1)
+
+                    print(f"   → Updated corrections X={x}, Y={y}, Z={z} for gun_id={gun_id}")
+                else:
+                    print("   (ignored – does not match pattern)")
+
+        except Exception as e:
+            print(f"[ZigBee read error] {e}")
+
+        time.sleep(0.05)   # tiny sleep – we still want to be responsive
+
+# --------------------------------------------------------------
+# WEBSOCKET SERVER
+# --------------------------------------------------------------
+connected_clients = set()
+
+async def handle_client(ws):
+    global connected_clients
+    connected_clients.add(ws)
+    print(f"Client connected – {ws.remote_address}")
+
+    try:
+        # ----- command listener (SET) -----
+        async def recv_cmd():
+            try:
+                async for msg in ws:
+                    cmd = json.loads(msg)
+                    if cmd.get('command') == 'SET':
+                        with state.lock:
+                            # store current raw IMU as zero reference
+                            state.zero_pitch = state.pitch
+                            state.zero_roll  = state.roll
+                            state.zero_yaw   = state.yaw
+                            # **reset corrections** so UI instantly shows 0°
+                            state.correction_x = 0.0
+                            state.correction_y = 0.0
+                            state.correction_z = 0.0
+                        print("SET – zero reference + corrections cleared")
+            except websockets.exceptions.ConnectionClosed:
+                pass
+
+        cmd_task = asyncio.create_task(recv_cmd())
+
+        # ----- broadcast loop (1 Hz) -----
+        while True:
+            with state.lock:
+                # relative IMU = raw – zero + correction
+                rel_pitch = (state.pitch - state.zero_pitch) + state.correction_y
+                rel_roll  = (state.roll  - state.zero_roll)  + state.correction_x
+                rel_yaw   = (state.yaw   - state.zero_yaw)   + state.correction_z
+
+                payload = {
+                    "timestamp": datetime.now(UTC).isoformat() + "Z",
+                    "gun_id": state.gun_id,  # Added gun_id section
+                    "imu": {
+                        "pitch":   round(rel_pitch, 2),
+                        "roll":    round(rel_roll, 2),
+                        "yaw":     round(rel_yaw, 2),
+                        "heading": round(state.heading, 2)
+                    },
+                    "gnss": {
+                        "latitude":  round(state.latitude, 6),
+                        "longitude": round(state.longitude, 6),
+                        "altitude":  round(state.altitude, 1)
+                    },
+                    "corrections": {
+                        "x": round(state.correction_x, 2),
+                        "y": round(state.correction_y, 2),
+                        "z": round(state.correction_z, 2)
+                    },
+                    "target": {                     # **target = corrections**
+                        "pitch": round(state.correction_y, 2),
+                        "roll":  round(state.correction_x, 2),
+                        "yaw":   round(state.correction_z, 2)
+                    }
+                }
+
+            # Print the sent data to terminal for visibility
+            print(f"Sending to clients: gun_id={payload['gun_id']}, heading={payload['imu']['heading']}, full payload={json.dumps(payload)}")
+
+            await ws.send(json.dumps(payload))
+            await asyncio.sleep(1.0)          # 1-second delay
+
+    except websockets.exceptions.ConnectionClosed:
+        print("Client disconnected")
+    finally:
+        connected_clients.discard(ws)
+
+# --------------------------------------------------------------
+# MAIN
+# --------------------------------------------------------------
+async def main():
+    print("Artillery Pointing System Server")
+    print(f"WebSocket: ws://{HOST}:{PORT}")
+    print(f"Update rate: {UPDATE_RATE_HZ} Hz (1-second delay)")
+
+    # start sensor threads
+    threading.Thread(target=read_imu_data, daemon=True).start()
+    threading.Thread(target=read_gnss_data, daemon=True).start()
+    threading.Thread(target=read_zigbee_corrections, daemon=True).start()
+
+    async with websockets.serve(handle_client, HOST, PORT):
+        await asyncio.Future()   # run forever
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nServer stopped")
+        if ser and ser.is_open:
+            ser.close()
